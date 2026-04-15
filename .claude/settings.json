@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.alibaba.com)",
+      "WebFetch(domain:www.dypsensor.com)",
+      "WebSearch",
+      "WebFetch(domain:www.scribd.com)",
+      "WebFetch(domain:www.dypcn.com)"
+    ]
+  }
+}
