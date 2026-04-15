@@ -429,34 +429,96 @@ class E09:
             if sleep_s > 0:
                 time.sleep(sleep_s)
 
-    # ── 슬레이브 주소 변경 ────────────────────────────────────────────────────
+    # ── 슬레이브 주소 스캔 / 변경 ────────────────────────────────────────────
 
-    def set_slave_address(self, new_address: int, timeout: float = 1.0) -> bool:
-        """E09 슬레이브 주소(CAN ID) 변경.
+    def scan(
+        self,
+        start: int = 0x01,
+        end:   int = 0x20,
+        timeout_per_addr: float = 0.6,
+    ) -> Optional[int]:
+        """CAN 버스를 순차 탐색하여 E09 슬레이브 주소 검색.
 
-        변경 성공 시 CAN ID = 0x0520 + new_address 로 갱신됨.
+        각 주소에 거리 읽기 명령(0x01)을 전송하고 유효한 응답 패킷
+        (data[0] == 0x03, data[1] in 1~3) 이 돌아오면 해당 주소를 반환.
+        George가 확인한 프로토콜(0x01 명령 / 0x03 응답 헤더)만 사용.
 
-        명령 포맷: [curr_addr][0x06][0x02][0x00][0x00][new_addr]
-        (제조사 예시 기준: 01 06 02 00 00 05)
+        Args:
+            start:            스캔 시작 주소 (기본: 0x01)
+            end:              스캔 종료 주소 (기본: 0x20)
+            timeout_per_addr: 주소당 응답 대기 시간 초 (기본: 0.6s).
+                              Mode 1 최대 응답 시간(428ms) 보다 여유 있게 설정.
+
+        Returns:
+            발견된 슬레이브 주소 (int). 범위 내에서 응답 없으면 None.
+        """
+        self._require_connection()
+
+        total = end - start + 1
+        for idx, addr in enumerate(range(start, end + 1), start=1):
+            test_id = self.CAN_BASE_ID + addr
+            print(f"\r  스캔 중... [{idx}/{total}] CAN ID {test_id:#05x} (slave {addr:#04x})",
+                  end='', flush=True)
+
+            msg = can.Message(
+                arbitration_id=test_id,
+                data=[self.CMD_READ],
+                is_extended_id=False,
+            )
+            try:
+                self._bus.send(msg)
+            except can.CanOperationError:
+                continue
+
+            # 첫 번째 유효 응답 패킷이 오면 이 주소가 현재 슬레이브
+            deadline = time.monotonic() + timeout_per_addr
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                frame = self._bus.recv(timeout=remaining)
+                if frame is None:
+                    break
+                if (
+                    frame.arbitration_id == test_id
+                    and len(frame.data) >= 2
+                    and frame.data[0] == 0x03
+                    and frame.data[1] in (1, 2, 3)
+                ):
+                    print()   # 줄바꿈
+                    return addr
+
+        print()   # 줄바꿈
+        return None
+
+    def set_slave_address(self, new_address: int) -> bool:
+        """E09 슬레이브 주소(CAN ID) 변경 명령 전송.
+
+        ※ 변경은 E09 모듈 전원을 껐다 켜야 적용됨.
+           명령 전송 성공 여부만 반환하며, 즉시 검증하지 않음.
+
+        명령 포맷 (제조사 예시 기준: 01 06 02 00 00 05):
+          [curr_addr][0x06][0x02][0x00][0x00][new_addr]
 
         Args:
             new_address: 새 슬레이브 주소 (0x01~0xFE)
-            timeout:     응답 대기 최대 시간 (초, 기본값 1.0)
 
         Returns:
-            True: 에코 응답 확인 후 주소 갱신 성공
-            False: 타임아웃 또는 응답 불일치
+            True:  명령 전송 성공
+            False: 전송 실패 (Bus-Off 등)
         """
         self._require_connection()
         if not 0x01 <= new_address <= 0xFE:
             raise ValueError(f"슬레이브 주소는 0x01~0xFE 사이여야 합니다. (입력값: {new_address:#04x})")
+        if new_address == self._slave:
+            return True
 
         data = bytes([
             self._slave,
             self.FUNC_WRITE,
             (self.REG_SLAVE_ADDR >> 8) & 0xFF,   # 0x02
             self.REG_SLAVE_ADDR & 0xFF,           # 0x00
-            0x00,                                 # 상위 바이트
+            0x00,
             new_address,
         ])
         msg = can.Message(
@@ -464,23 +526,13 @@ class E09:
             data=data,
             is_extended_id=False,
         )
-        self._bus.send(msg)
-
-        resp = self._bus.recv(timeout=timeout)
-        if resp is None:
+        try:
+            self._bus.send(msg)
+        except can.CanOperationError as e:
+            print(f"[set_slave_address] 전송 실패: {e}")
             return False
 
-        resp_data = bytes(resp.data)
-        if (
-            resp.arbitration_id == self.can_id
-            and len(resp_data) >= 6
-            and resp_data[1] == self.FUNC_WRITE
-            and resp_data[5] == new_address
-        ):
-            self._slave = new_address
-            return True
-
-        return False
+        return True
 
     # ── 생존 확인 ──────────────────────────────────────────────────────────────
 
@@ -539,33 +591,100 @@ class E09:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _demo():
-    """연속 거리 측정 데모 (Ctrl+C로 종료)."""
+    """연속 거리 측정 / CAN ID 변경 테스트 데모 (Ctrl+C로 종료)."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="E09 CAN 거리 측정 데모")
-    parser.add_argument("--channel",  default="can0",  help="CAN 인터페이스 (기본: can0)")
-    parser.add_argument("--slave",    type=lambda x: int(x, 0), default=0x01,
-                        help="슬레이브 주소 (기본: 0x01)")
-    parser.add_argument("--interval", type=float, default=E09.POLL_INTERVAL_S,
+    parser = argparse.ArgumentParser(description="E09 CAN 드라이버 데모")
+    parser.add_argument("--channel",   default="can0",
+                        help="CAN 인터페이스 (기본: can0)")
+    parser.add_argument("--slave",     type=lambda x: int(x, 0), default=0x01,
+                        help="슬레이브 주소 (기본: 0x01, 거리 측정 모드에서 사용)")
+    parser.add_argument("--interval",  type=float, default=E09.POLL_INTERVAL_S,
                         help=f"폴링 주기 초 (기본: {E09.POLL_INTERVAL_S}s)")
-    parser.add_argument("--count",    type=int, default=None,
-                        help="측정 횟수 (기본: 무한)")
+    parser.add_argument("--count",     type=int, default=None,
+                        help="거리 측정 횟수 (기본: 무한)")
+
+    # 스캔 / CAN ID 변경 옵션
+    parser.add_argument("--scan",      action="store_true",
+                        help="CAN 버스를 스캔하여 현재 슬레이브 주소 탐색 후 종료")
+    parser.add_argument("--scan-end",  type=lambda x: int(x, 0), default=0x20,
+                        metavar="END_ADDR",
+                        help="스캔 종료 주소 (기본: 0x20, --scan / --set-addr 공통)")
+    parser.add_argument("--set-addr",  type=lambda x: int(x, 0), default=None,
+                        metavar="NEW_ADDR",
+                        help="현재 주소를 스캔으로 찾아 변경 후 종료 (예: --set-addr 0x02)")
     args = parser.parse_args()
 
-    print(f"E09 CAN 드라이버 데모")
+    print("E09 CAN 드라이버 데모")
     print(f"  채널:     {args.channel}")
-    print(f"  Slave:    {args.slave:#04x}  (CAN ID: {E09.CAN_BASE_ID + args.slave:#05x})")
-    print(f"  주기:     {args.interval * 1000:.0f} ms")
-    print(f"  횟수:     {'무한' if args.count is None else args.count}")
-    print("-" * 50)
 
     try:
-        with E09(channel=args.channel, slave_address=args.slave) as hub:
+        # 스캔/변경 모드는 초기 --slave 값 무관하게 0x01부터 접속
+        init_slave = 0x01 if (args.scan or args.set_addr is not None) else args.slave
+        with E09(channel=args.channel, slave_address=init_slave) as hub:
+
+            # ── 스캔 모드 ────────────────────────────────────────────────────
+            if args.scan:
+                print(f"  모드:     슬레이브 주소 스캔 (0x01 ~ {args.scan_end:#04x})")
+                print("-" * 50)
+                found = hub.scan(start=0x01, end=args.scan_end)
+                if found is not None:
+                    print(f"  발견: 슬레이브 주소 {found:#04x}"
+                          f"  (CAN ID: {E09.CAN_BASE_ID + found:#05x})")
+                else:
+                    print(f"  응답 없음: 0x01~{args.scan_end:#04x} 범위에서 E09를 찾지 못했습니다.")
+                    print(f"  --scan-end 값을 높이거나 배선/전원을 확인하세요.")
+                return
+
+            # ── CAN ID 변경 모드 ─────────────────────────────────────────────
+            if args.set_addr is not None:
+                new_addr   = args.set_addr
+                new_can_id = E09.CAN_BASE_ID + new_addr
+
+                print(f"  모드:     CAN ID 변경 (목표: {new_addr:#04x},"
+                      f" CAN ID: {new_can_id:#05x})")
+                print("-" * 50)
+
+                # 1단계: 스캔으로 현재 주소 탐색
+                print(f"[1/3] 현재 슬레이브 주소 탐색 중 (0x01 ~ {args.scan_end:#04x})...")
+                current_addr = hub.scan(start=0x01, end=args.scan_end)
+                if current_addr is None:
+                    print(f"      응답 없음: E09를 찾지 못했습니다. 배선/전원을 확인하세요.")
+                    return
+                old_can_id = E09.CAN_BASE_ID + current_addr
+                print(f"      현재: {current_addr:#04x}  (CAN ID: {old_can_id:#05x})")
+
+                if current_addr == new_addr:
+                    print(f"      이미 목표 주소({new_addr:#04x})와 동일합니다. 변경 불필요.")
+                    return
+
+                # 2단계: 발견된 현재 주소로 드라이버 주소 전환 후 변경 명령 전송
+                hub._slave = current_addr
+                print(f"[2/3] 주소 변경 명령 전송 ({current_addr:#04x} → {new_addr:#04x})...")
+                ok = hub.set_slave_address(new_addr)
+                if not ok:
+                    print("      실패: 명령 전송 중 오류 발생.")
+                    return
+                print("      전송 완료.")
+
+                # 3단계: 전원 재시작 안내
+                print(f"[3/3] E09 모듈의 전원을 껐다 켜주세요.")
+                print(f"      재시작 후 새 CAN ID {new_can_id:#05x} 로 통신하세요:")
+                print(f"        python3 scripts/e09.py --slave {new_addr:#04x}")
+                return
+
+            # ── 연속 거리 측정 모드 ──────────────────────────────────────────
+            print(f"  Slave:    {args.slave:#04x}  (CAN ID: {E09.CAN_BASE_ID + args.slave:#05x})")
+            print(f"  주기:     {args.interval * 1000:.0f} ms")
+            print(f"  횟수:     {'무한' if args.count is None else args.count}")
+            print("-" * 50)
+
             n = 0
             for result in hub.continuous_read(count=args.count, interval=args.interval):
                 n += 1
                 print(f"[{n:04d}] {result}")
                 print()
+
     except OSError as e:
         print(f"[오류] {e}")
     except KeyboardInterrupt:
